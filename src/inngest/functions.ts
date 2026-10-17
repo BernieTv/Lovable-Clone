@@ -5,10 +5,11 @@ import {
   createState,
   createTool,
   type Message,
-  gemini,
+  openai,
   type Tool,
 } from '@inngest/agent-kit';
 import { z } from 'zod';
+import { NonRetriableError } from 'inngest';
 
 import prisma from '@/lib/prisma';
 import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from '@/prompt';
@@ -24,52 +25,123 @@ import { SANDBOX_TIMEOUT_IN_MS } from '@/constants';
 interface AgentState {
   summary: string;
   files: FileCollection;
+  toolInvocationCounts: Record<string, number>;
+}
+
+const eventSchema = z.object({
+  projectId: z.string().min(1),
+  messageId: z.string().min(1),
+  userId: z.string().min(1),
+  value: z.string().min(1),
+});
+
+function asFileCollection(value: unknown): FileCollection {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  );
+}
+
+function nextToolStep(
+  name: string,
+  network: Tool.Options<AgentState>['network'],
+) {
+  const invocation = (network.state.data.toolInvocationCounts[name] ?? 0) + 1;
+  network.state.data.toolInvocationCounts[name] = invocation;
+
+  return {
+    id: `${name}-${invocation}`,
+    name: `${name} (${invocation})`,
+  };
 }
 
 export const codeAgentFunction = inngest.createFunction(
-  { id: 'code-agent' },
+  {
+    id: 'code-agent',
+    concurrency: {
+      limit: 1,
+      key: 'event.data.projectId',
+    },
+  },
   { event: 'code-agent/run' },
   async ({ event, step }) => {
+    const eventData = eventSchema.safeParse(event.data);
+
+    if (!eventData.success) {
+      throw new NonRetriableError('Invalid code-agent event payload');
+    }
+
+    const { messageId, projectId, userId, value } = eventData.data;
+
+    const projectContext = await step.run('load-project-context', async () => {
+      const project = await prisma.project.findFirst({
+        where: { id: projectId, userId },
+        select: { id: true },
+      });
+
+      if (!project) {
+        throw new NonRetriableError('Project not found or access denied');
+      }
+
+      const [messages, latestFragmentMessage] = await Promise.all([
+        prisma.message.findMany({
+          where: {
+            projectId,
+            id: { not: messageId },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        }),
+        prisma.message.findFirst({
+          where: {
+            projectId,
+            fragment: { isNot: null },
+          },
+          orderBy: { createdAt: 'desc' },
+          select: {
+            fragment: {
+              select: { files: true },
+            },
+          },
+        }),
+      ]);
+
+      const formattedMessages: Message[] = messages.reverse().map((message) => ({
+        type: 'text',
+        role: message.role === 'ASSISTANT' ? 'assistant' : 'user',
+        content: message.content,
+      }));
+
+      return {
+        files: asFileCollection(latestFragmentMessage?.fragment?.files),
+        messages: formattedMessages,
+      };
+    });
+
     const sandboxId = await step.run('get-sandbox-id', async () => {
       const sandbox = await Sandbox.create('vibe-nextjs-bek-2');
       await sandbox.setTimeout(SANDBOX_TIMEOUT_IN_MS);
+
+      for (const [path, content] of Object.entries(projectContext.files)) {
+        await sandbox.files.write(path, content);
+      }
+
       return sandbox.sandboxId;
     });
-
-    const previousMessages = await step.run(
-      'get-previous-messages',
-      async () => {
-        const formattedMessages: Message[] = [];
-
-        const messages = await prisma.message.findMany({
-          where: {
-            projectId: event.data.projectId,
-          },
-          orderBy: {
-            createdAt: 'desc',
-          },
-          take: 5,
-        });
-
-        for (const message of messages) {
-          formattedMessages.push({
-            type: 'text',
-            role: message.role === 'ASSISTANT' ? 'assistant' : 'user',
-            content: message.content,
-          });
-        }
-
-        return formattedMessages.reverse();
-      },
-    );
 
     const state = createState<AgentState>(
       {
         summary: '',
-        files: {},
+        files: projectContext.files,
+        toolInvocationCounts: {},
       },
       {
-        messages: previousMessages,
+        messages: projectContext.messages,
       },
     );
 
@@ -78,10 +150,11 @@ export const codeAgentFunction = inngest.createFunction(
       name: 'code-agent',
       description: 'An expert coding agent',
       system: PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
+      model: openai({
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        baseUrl: process.env.OPENAI_BASE_URL || undefined,
         defaultParameters: {
-          generationConfig: { temperature: 0.1 },
+          temperature: 0.1,
         },
       }),
       tools: [
@@ -91,8 +164,11 @@ export const codeAgentFunction = inngest.createFunction(
           parameters: z.object({
             command: z.string(),
           }),
-          handler: async ({ command }, { step }) => {
-            return await step?.run('terminal', async () => {
+          handler: async (
+            { command },
+            { step, network }: Tool.Options<AgentState>,
+          ) => {
+            const run = async () => {
               const buffers = {
                 stdout: '',
                 stderr: '',
@@ -116,7 +192,11 @@ export const codeAgentFunction = inngest.createFunction(
                 );
                 return `command failed: ${error}\nstdOut: ${buffers.stdout}\nstdError: ${buffers.stderr}`;
               }
-            });
+            };
+
+            return step
+              ? await step.run(nextToolStep('terminal', network), run)
+              : await run();
           },
         }),
         createTool({
@@ -134,24 +214,25 @@ export const codeAgentFunction = inngest.createFunction(
             { files },
             { step, network }: Tool.Options<AgentState>,
           ) => {
-            const newFiles = await step?.run(
-              'createOrUpdateFiles',
-              async () => {
-                try {
-                  const updatedFiles = network.state.data.files || {};
-                  const sandbox = await getSandbox(sandboxId);
+            const run = async () => {
+              try {
+                const updatedFiles = { ...network.state.data.files };
+                const sandbox = await getSandbox(sandboxId);
 
-                  for (const file of files) {
-                    await sandbox.files.write(file.path, file.content);
-                    updatedFiles[file.path] = file.content;
-                  }
-
-                  return updatedFiles;
-                } catch (error) {
-                  return 'Error: ' + error;
+                for (const file of files) {
+                  await sandbox.files.write(file.path, file.content);
+                  updatedFiles[file.path] = file.content;
                 }
-              },
-            );
+
+                return updatedFiles;
+              } catch (error) {
+                return 'Error: ' + error;
+              }
+            };
+
+            const newFiles = step
+              ? await step.run(nextToolStep('createOrUpdateFiles', network), run)
+              : await run();
 
             if (typeof newFiles === 'object') {
               network.state.data.files = newFiles;
@@ -164,8 +245,11 @@ export const codeAgentFunction = inngest.createFunction(
           parameters: z.object({
             files: z.array(z.string()),
           }),
-          handler: async ({ files }, { step }) => {
-            return await step?.run('readFiles', async () => {
+          handler: async (
+            { files },
+            { step, network }: Tool.Options<AgentState>,
+          ) => {
+            const run = async () => {
               try {
                 const sandbox = await getSandbox(sandboxId);
                 const contents = [];
@@ -179,7 +263,11 @@ export const codeAgentFunction = inngest.createFunction(
               } catch (error) {
                 return 'Error: ' + error;
               }
-            });
+            };
+
+            return step
+              ? await step.run(nextToolStep('readFiles', network), run)
+              : await run();
           },
         }),
       ],
@@ -215,16 +303,17 @@ export const codeAgentFunction = inngest.createFunction(
       },
     });
 
-    const result = await network.run(event.data.value, { state });
+    const result = await network.run(value, { state });
 
     const fragmentTitleGenerator = createAgent({
       name: 'fragment-title-generator',
       description: 'A fragment title generator',
       system: FRAGMENT_TITLE_PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
+      model: openai({
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        baseUrl: process.env.OPENAI_BASE_URL || undefined,
         defaultParameters: {
-          generationConfig: { temperature: 0.1 },
+          temperature: 0.1,
         },
       }),
     });
@@ -233,10 +322,11 @@ export const codeAgentFunction = inngest.createFunction(
       name: 'response-generator',
       description: 'A response generator',
       system: RESPONSE_PROMPT,
-      model: gemini({
-        model: 'gemini-2.0-flash',
+      model: openai({
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        baseUrl: process.env.OPENAI_BASE_URL || undefined,
         defaultParameters: {
-          generationConfig: { temperature: 0.1 },
+          temperature: 0.1,
         },
       }),
     });
@@ -260,10 +350,19 @@ export const codeAgentFunction = inngest.createFunction(
     });
 
     await step.run('save-result', async () => {
+      const ownedProject = await prisma.project.findFirst({
+        where: { id: projectId, userId },
+        select: { id: true },
+      });
+
+      if (!ownedProject) {
+        throw new NonRetriableError('Project not found or access denied');
+      }
+
       if (isError) {
         return await prisma.message.create({
           data: {
-            projectId: event.data.projectId,
+            projectId,
             content: 'Something went wrong. Please try again.',
             role: 'ASSISTANT',
             type: 'ERROR',
@@ -273,7 +372,7 @@ export const codeAgentFunction = inngest.createFunction(
 
       return await prisma.message.create({
         data: {
-          projectId: event.data.projectId,
+          projectId,
           content: parseAgentOutput(responseOutput),
           role: 'ASSISTANT',
           type: 'RESULT',

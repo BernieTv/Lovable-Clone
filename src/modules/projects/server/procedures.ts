@@ -81,15 +81,38 @@ export const projectsRouter = createTRPCRouter({
             },
           },
         },
-      });
-
-      await inngest.send({
-        name: "code-agent/run",
-        data: {
-          value: input.value,
-          projectId: createdProject.id,
+        include: {
+          messages: true,
         },
       });
+
+      const initialMessage = createdProject.messages[0];
+
+      if (!initialMessage) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Project was created without an initial message.",
+        });
+      }
+
+      try {
+        await inngest.send({
+          id: `code-agent-run-${initialMessage.id}`,
+          name: "code-agent/run",
+          data: {
+            value: input.value,
+            projectId: createdProject.id,
+            messageId: initialMessage.id,
+            userId: ctx.auth.userId,
+          },
+        });
+      } catch (error) {
+        console.error("Failed to dispatch code agent", error);
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Project saved, but generation could not be started. Please retry.",
+        });
+      }
 
       return createdProject;
     }),

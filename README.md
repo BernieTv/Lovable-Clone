@@ -15,7 +15,7 @@ Lovable Clone is your AI-powered sidekick 🤖✨ — built for speed 🚀, styl
 - **AI Agent Toolkit:** Inngest agent utilities 🤖
 - **Auth & Billing:** [Clerk](https://clerk.dev) 🔐💳
 - **Database:** Prisma ORM + [Neon](https://neon.tech) 🗄️
-- **AI Models:** OpenAI, Anthropic, Grok, Gemini 🧠
+- **AI Model:** OpenAI 🧠
 - **Execution:** [E2B Cloud Sandboxes](https://e2b.dev) 🖥️ + Docker 🐳
 
 ---
@@ -66,7 +66,9 @@ DATABASE_URL="*"
 
 NEXT_PUBLIC_APP_URL="*"
 
-GEMINI_API_KEY="*"
+OPENAI_API_KEY="*"
+OPENAI_MODEL="gpt-4.1-mini"
+OPENAI_BASE_URL="https://api.openai.com/v1/"
 
 E2B_API_KEY="*"
 

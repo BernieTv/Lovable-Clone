@@ -81,13 +81,24 @@ export const messagesRouter = createTRPCRouter({
         },
       });
 
-      await inngest.send({
-        name: "code-agent/run",
-        data: {
-          value: input.value,
-          projectId: existingProject.id,
-        },
-      });
+      try {
+        await inngest.send({
+          id: `code-agent-run-${createdMessage.id}`,
+          name: "code-agent/run",
+          data: {
+            value: input.value,
+            projectId: existingProject.id,
+            messageId: createdMessage.id,
+            userId: ctx.auth.userId,
+          },
+        });
+      } catch (error) {
+        console.error("Failed to dispatch code agent", error);
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Message saved, but generation could not be started. Please retry.",
+        });
+      }
 
       return createdMessage;
     }),

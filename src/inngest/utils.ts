@@ -1,6 +1,6 @@
 import { SANDBOX_TIMEOUT_IN_MS } from "@/constants";
 import { Sandbox } from "@e2b/code-interpreter";
-import { AgentResult, type Message, TextMessage } from "@inngest/agent-kit";
+import { AgentResult, type Message } from "@inngest/agent-kit";
 
 export async function getSandbox(sandboxId: string) {
   const sandbox = await Sandbox.connect(sandboxId);
@@ -10,33 +10,38 @@ export async function getSandbox(sandboxId: string) {
 }
 
 export function lastAssistantTextMessageContent(result: AgentResult) {
-  const lastAssistantTextMessageIndex = result.output.findLastIndex(
-    (message) => message.role === "assistant"
+  const message = result.output.findLast(
+    (candidate) =>
+      candidate.type === "text" && candidate.role === "assistant"
   );
 
-  const message = result.output[lastAssistantTextMessageIndex] as
-    | TextMessage
-    | undefined;
-
-  if (!message?.content) {
+  if (!message || message.type !== "text") {
     return undefined;
   }
 
-  return typeof message.content === "string"
-    ? message.content
-    : message.content.map((c) => c.text).join("");
+  return textContent(message.content);
 }
 
 export function parseAgentOutput(value: Message[]) {
-  const output = value[0];
+  const output = value.find((message) => message.type === "text");
 
-  if (output.type !== "text") {
+  if (!output || output.type !== "text") {
     return "Fragment";
   }
 
-  if (Array.isArray(output.content)) {
-    return output.content.map((txt) => txt).join("");
-  } else {
-    return output.content;
+  return textContent(output.content) || "Fragment";
+}
+
+function textContent(content: string | Array<{ type: "text"; text: string }>) {
+  if (typeof content === "string") {
+    return content;
   }
+
+  return content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        part?.type === "text" && typeof part.text === "string"
+    )
+    .map((part) => part.text)
+    .join("");
 }

@@ -1,5 +1,5 @@
 import { CopyCheckIcon, CopyIcon } from "lucide-react";
-import { Fragment, useCallback, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { MAX_SEGMENTS } from "@/constants";
@@ -97,6 +97,12 @@ const FileExplorer = ({ files }: FileExplorerProps) => {
     return fileKeys.length > 0 ? fileKeys[0] : null;
   });
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const fileKeys = Object.keys(files);
+    setSelectedFile(fileKeys.length > 0 ? fileKeys[0] : null);
+    setCopied(false);
+  }, [files]);
 
   const treeData = useMemo(() => {
     return convertFilesToTreeItems(files);
